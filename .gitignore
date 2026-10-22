@@ -1,0 +1,14 @@
+# Secrets (WiFi password, Telegram bot token)
+secrets.h
+
+# Build output
+build/
+firmware/**/build/
+*.bin
+*.elf
+*.map
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
