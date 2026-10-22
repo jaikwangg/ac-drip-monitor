@@ -88,6 +88,9 @@ static const char NTP_3[] = "time.cloudflare.com";
 
 // Pending Telegram messages kept across WiFi outages (and software reboots).
 static const uint8_t  QUEUE_CAP   = 6;
+// After this many HTTP 400s in a row the head message is dropped, but only if it
+// is not a water alert (alerts are never dropped because of a 400).
+static const uint8_t  BAD_REQUEST_DROP_AFTER = 5;
 static const uint16_t MSG_MAX     = 512;   // bytes, UTF-8 (Thai is 3 bytes/char)
 
 // -----------------------------------------------------------------------------
@@ -108,7 +111,7 @@ struct SensorState {
 static SensorState g_sensor[NUM_SENSORS];
 
 enum EventType : uint8_t { EV_ALERT = 1, EV_CLEAR, EV_REPEAT, EV_HEARTBEAT };
-enum SendResult { SEND_OK, SEND_RETRY, SEND_DROP, SEND_RETRY_NOW };
+enum SendResult { SEND_OK, SEND_RETRY, SEND_BAD_REQUEST, SEND_RETRY_NOW };
 
 struct Event {
   uint8_t type;
@@ -149,6 +152,7 @@ static uint32_t g_lastReadMs = 0;
 static bool g_firstRead = true;
 static uint32_t g_nextSendMs = 0;
 static uint32_t g_sendBackoffMs = SEND_BACKOFF_MIN_MS;
+static uint8_t g_badRequestStreak = 0;  // consecutive HTTP 400s for the head message
 
 static uint32_t g_lastLedMs = 0;
 static bool g_ledOn = false;
@@ -226,14 +230,15 @@ static uint32_t wetDurationMs(const SensorState &s, uint32_t now) {
 
 static const char *resetReasonText(esp_reset_reason_t r) {
   switch (r) {
-    case ESP_RST_POWERON:  return "ไฟเข้า (power-on)";
+    // Classic ESP32 also reports POWERON when the EN/reset button is pressed.
+    case ESP_RST_POWERON:  return "ไฟเข้า หรือกดปุ่ม EN (power-on)";
     case ESP_RST_SW:       return "รีบูตโดยโปรแกรม (เช่น WiFi หลุดนาน)";
     case ESP_RST_PANIC:    return "โปรแกรมขัดข้อง (panic)";
     case ESP_RST_INT_WDT:
     case ESP_RST_TASK_WDT:
     case ESP_RST_WDT:      return "watchdog รีเซ็ต (บอร์ดค้าง)";
     case ESP_RST_BROWNOUT: return "ไฟตก (brownout)";
-    case ESP_RST_EXT:      return "กดปุ่ม EN/รีเซ็ต";
+    case ESP_RST_EXT:      return "รีเซ็ตจากขาภายนอก";
     case ESP_RST_DEEPSLEEP:return "ตื่นจาก deep sleep";
     default:               return "ไม่ทราบ";
   }
@@ -453,7 +458,7 @@ static SendResult telegramSend(const char *text, uint32_t &retryAfterMs) {
     if (jsonInt(resp, "retry_after", v) && v > 0 && v < 3600) retryAfterMs = (uint32_t)v * 1000UL;
     return SEND_RETRY;
   }
-  if (code == 400 && jsonInt(resp, "migrate_to_chat_id", v)) {
+  if (code == 400 && jsonInt(resp, "migrate_to_chat_id", v) && v != 0) {
     // The group was upgraded to a supergroup and has a new id.
     snprintf(g_persist.chatIdOverride, sizeof(g_persist.chatIdOverride), "%lld", v);
     persistSeal();
@@ -462,8 +467,9 @@ static SendResult telegramSend(const char *text, uint32_t &retryAfterMs) {
     return SEND_RETRY_NOW;
   }
   if (code == 400) {
-    // Malformed request: this exact message will never succeed, do not block the queue.
-    return SEND_DROP;
+    // e.g. "chat not found", "not enough rights", or a malformed migrate reply.
+    // The caller retries with backoff and never drops a water alert for this.
+    return SEND_BAD_REQUEST;
   }
   // 401 bad token, 403 bot removed from group, 404, 5xx: keep and retry with backoff.
   return SEND_RETRY;
@@ -488,7 +494,12 @@ static void buildBootMessage(char *buf, size_t len) {
 // Sends at most one message per call so sensor reads keep running.
 static void serviceTelegram(uint32_t now) {
   if (!g_wifiUp || !timeReached(now, g_nextSendMs)) return;
-  if (!g_bootMsgPending && g_persist.count == 0) return;
+  if (!g_bootMsgPending && g_persist.count == 0) {
+    // Keep the deadline close to now so the signed comparison in timeReached()
+    // cannot stall after ~24.8 days of an idle queue.
+    g_nextSendMs = now;
+    return;
+  }
 
   static char bootBuf[MSG_MAX];
   const char *text;
@@ -505,16 +516,32 @@ static void serviceTelegram(uint32_t now) {
 
   switch (r) {
     case SEND_OK:
-    case SEND_DROP:
-      if (r == SEND_DROP) Serial.println("[tg] message rejected (400), dropped");
       if (g_bootMsgPending) g_bootMsgPending = false;
       else queueRemove(0);
+      g_badRequestStreak = 0;
       g_sendBackoffMs = SEND_BACKOFF_MIN_MS;
       g_nextSendMs = after + 3000;  // stay well under Telegram's 20 msg/min group limit
       break;
     case SEND_RETRY_NOW:
+      g_badRequestStreak = 0;
       g_nextSendMs = after;
       break;
+    case SEND_BAD_REQUEST: {
+      if (g_badRequestStreak < 255) g_badRequestStreak++;
+      bool isAlert = !g_bootMsgPending && g_persist.q[0].type == EV_ALERT;
+      if (!isAlert && g_badRequestStreak >= BAD_REQUEST_DROP_AFTER) {
+        Serial.printf("[tg] HTTP 400 x%u: dropping %s (alerts are kept)\n", g_badRequestStreak,
+                      g_bootMsgPending ? "boot message" : "non-alert message");
+        if (g_bootMsgPending) g_bootMsgPending = false;
+        else queueRemove(0);
+        g_badRequestStreak = 0;
+        g_nextSendMs = after + g_sendBackoffMs;
+        break;
+      }
+      Serial.printf("[tg] HTTP 400 x%u%s - check CHAT_ID and that the bot is in the group\n",
+                    g_badRequestStreak, isAlert ? " on a water alert (kept)" : "");
+    }
+      [[fallthrough]];  // retry with backoff
     case SEND_RETRY:
       g_nextSendMs = after + (retryAfterMs ? retryAfterMs : g_sendBackoffMs);
       Serial.printf("[tg] retry in %lu s, pending %u\n",
