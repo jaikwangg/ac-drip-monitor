@@ -64,6 +64,10 @@ static const uint32_t READ_INTERVAL_MS      = 5000;      // read both sensors ev
 static const uint32_t SENSOR_SETTLE_MS      = 20;        // after powering a sensor
 static const uint8_t  ADC_SAMPLES           = 8;         // averaged per reading
 static const uint8_t  DEBOUNCE_READS        = 2;         // consecutive reads to change state
+// Hysteresis (raw ADC units): once a sensor is wet, the reading must come back past threshold by this much
+// before it counts as dry again, so a slowly drying pad or a reading near the threshold does not flip
+// wet/dry every few seconds (alert spam, and a full queue during an outage).
+static const uint16_t DRY_HYSTERESIS        = 200;
 static const uint32_t REPEAT_WET_MS         = 60UL * 60UL * 1000UL;  // repeat alert while wet
 static const uint8_t  HEARTBEAT_HOUR        = 8;         // daily heartbeat, local time (ICT)
 static const uint8_t  HEARTBEAT_MINUTE      = 30;
@@ -171,6 +175,7 @@ static_assert(sizeof(SENSORS) / sizeof(SENSORS[0]) == 2, "README and wiring assu
 static_assert(isAdc1Pin(SENSORS[0].pinAdc) && isAdc1Pin(SENSORS[1].pinAdc),
               "sensor AO pins must be ADC1 (GPIO32-39); ADC2 fails while WiFi is on");
 static_assert(DEBOUNCE_READS >= 1, "DEBOUNCE_READS must be >= 1");
+static_assert(DRY_HYSTERESIS < 4096, "DRY_HYSTERESIS must be below the 12-bit ADC range");
 static_assert(HEARTBEAT_HOUR < 24 && HEARTBEAT_MINUTE < 60, "bad heartbeat time");
 
 // -----------------------------------------------------------------------------
@@ -248,8 +253,17 @@ static const char *chatId() {
   return g_persist.chatIdOverride[0] ? g_persist.chatIdOverride : CHAT_ID;
 }
 
-static bool isWetReading(const SensorConfig &c, uint16_t raw) {
-  return c.wetWhenLow ? (raw < c.threshold) : (raw > c.threshold);
+// While the sensor is (debounced) wet, the dry side of the threshold moves away by DRY_HYSTERESIS,
+// clamped to the ADC range so a threshold near either end can still read dry (4095 or 0).
+static bool isWetReading(const SensorConfig &c, uint16_t raw, bool currentlyWet) {
+  if (c.wetWhenLow) {
+    uint32_t th = currentlyWet ? (uint32_t)c.threshold + DRY_HYSTERESIS : c.threshold;
+    if (th > 4095) th = 4095;
+    return raw < th;
+  }
+  int32_t th = currentlyWet ? (int32_t)c.threshold - DRY_HYSTERESIS : c.threshold;
+  if (th < 0) th = 0;
+  return (int32_t)raw > th;
 }
 
 // -----------------------------------------------------------------------------
@@ -626,7 +640,7 @@ static void readAllSensors(uint32_t now) {
     const SensorConfig &c = SENSORS[i];
     SensorState &s = g_sensor[i];
     s.raw = readSensorRaw(c);
-    s.wetNow = isWetReading(c, s.raw);
+    s.wetNow = isWetReading(c, s.raw, s.wet);
     if (s.wetNow) { if (s.wetStreak < 255) s.wetStreak++; s.dryStreak = 0; }
     else          { if (s.dryStreak < 255) s.dryStreak++; s.wetStreak = 0; }
 
